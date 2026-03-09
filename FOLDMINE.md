@@ -21,7 +21,7 @@ Foldmine works in three phases:
 ## Usage
 
 ```
-folddisco foldmine -i <index_prefix> [options]
+folddisco mine -i <index_prefix> [options]
 ```
 
 ### Required
@@ -76,12 +76,45 @@ motif_id  num_residues  num_edges  support  count  motif_idf  mean_nres  adj_idf
 | `mean_nres` | Mean residue count of matching structures (estimated from up to 5 representative hits). |
 | `adj_idf` | Length-adjusted IDF: `motif_idf × (mean_nres + 1)^(−0.5)`.  Penalizes motifs found only in large multi-domain proteins.  Use this column to rank and filter. |
 | `edges` | Semicolon-separated edge descriptions: `nodeA-nodeB:hash_hex:AA1/AA2/ca_dist_Å/cb_dist_Å/angle°[/phi1°/phi2°]` |
-| `top_structures` | Comma-separated names of up to 5 representative matching structures |
+| `top_structures` | Comma-separated names of up to 5 representative matching structures, with residue positions when available (see below). |
 
-### Example row (2-residue, 1-edge motif)
+### `top_structures` column format
+
+When the original structure files are accessible at the paths stored in the index, Foldmine annotates each representative structure with the actual PDB residue serial numbers of the residues that realise the motif:
 
 ```
-0	2	1	0.4000	2	8.3214	312.5	0.4706	0-1:00013d8b:SER/HIS/6.82/8.23/-113.2/-101.3/-144.5	data/sp/1pq5.pdb,data/sp/4cha.pdb
+name:res0-res1-res2-...
+```
+
+- `name` — structure name (as stored in the index lookup table, typically the file path or PDB/AF accession)
+- `res0`, `res1`, … — PDB serial numbers of the residue assigned to abstract motif node 0, 1, … respectively
+
+Multiple structures are comma-separated:
+
+```
+1abc.pdb:57-102-195,2xyz.pdb:34-89-176,3def.pdb:61-108-201
+```
+
+**When structure files are not accessible** (e.g., the index was built on a different machine or the files have been moved), only the bare name is shown:
+
+```
+1abc.pdb,2xyz.pdb,3def.pdb
+```
+
+No error is printed in this case — residue annotation silently falls back to bare names.
+
+> **Note:** Residue annotation requires the original structure files (`.pdb`, `.cif`, or `.pdb.gz` / `.cif.gz`) to be readable at the paths recorded in the index.  The index itself stores only structure IDs — coordinates are not stored and cannot be recovered from the index alone.
+
+### Example row (2-residue, 1-edge motif, with residue annotation)
+
+```
+0	2	1	0.4000	2	8.3214	312.5	0.4706	0-1:00013d8b:SER/HIS/6.82/8.23/-113.2/-101.3/-144.5	data/sp/1pq5.pdb:57-102,data/sp/4cha.pdb:195-40
+```
+
+### Example row (bare names, no structure files available)
+
+```
+0	2	1	0.4000	2	8.3214	312.5	0.4706	0-1:00013d8b:SER/HIS/6.82/8.23/-113.2/-101.3/-144.5	1pq5.pdb,4cha.pdb
 ```
 
 ---
@@ -108,6 +141,8 @@ The index prefix is the filename without any extension (e.g., `index/h_sapiens_f
 <prefix>.type     # hash type and bin-count configuration
 ```
 
+> **Pre-built indices and residue annotation:** Pre-built indices reference the AlphaFold CIF files that were present on the server where the index was built.  Those paths are not available on your local machine, so `top_structures` will show bare accession names without residue positions.  To get residue annotations, build a local index with `folddisco index` pointing to your own copy of the structure files.
+
 ---
 
 ## Examples
@@ -120,8 +155,8 @@ Build an index from local PDB files and run Foldmine:
 # Index a set of serine peptidase structures
 folddisco index -p data/serine_peptidases -i index/serine_peptidases_folddisco
 
-# Mine motifs present in ≥ 40 % of the structures, up to 4 residues
-folddisco foldmine -i index/serine_peptidases_folddisco \
+# Mine motifs present in >= 40% of the structures, up to 4 residues
+folddisco mine -i index/serine_peptidases_folddisco \
     --min-support 0.4 --max-freq 0.9 \
     --max-residues 4 \
     -o motifs.tsv -v
@@ -136,9 +171,9 @@ aria2c https://opendata.mmseqs.org/folddisco/afdb_swissprot_v4_folddisco.tar.lz4
 lz4 -dc afdb_swissprot_v4_folddisco.tar.lz4 | tar -xvf -
 cd ..
 
-# Mine motifs present in ≥ 1 % of Swiss-Prot structures, ≤ 3 residues,
+# Mine motifs present in >= 1% of Swiss-Prot structures, <= 3 residues,
 # using 8 threads, limited to top 10 000 motifs, filtering trivial helices/sheets
-folddisco foldmine -i index/afdb_swissprot_v4_folddisco \
+folddisco mine -i index/afdb_swissprot_v4_folddisco \
     --min-support 0.01 --max-freq 0.5 \
     --max-residues 3 \
     --max-seeds 5000 \
@@ -153,7 +188,7 @@ folddisco foldmine -i index/afdb_swissprot_v4_folddisco \
 For databases with millions of structures, use aggressive limits to keep runtime manageable:
 
 ```bash
-folddisco foldmine -i index/afdb50_v4_folddisco \
+folddisco mine -i index/afdb50_v4_folddisco \
     --min-support 0.001 --max-freq 0.3 \
     --max-residues 3 \
     --max-seeds 2000 \
@@ -188,6 +223,10 @@ If a single-edge motif with hash *h* appears in fewer than `min_support × N` st
 
 Two abstract motif graphs that differ only by relabeling their residue positions (nodes) represent the same structural pattern. Foldmine normalizes every motif by trying all *n*! node-label permutations (at most 6! = 720 for `--max-residues 6`) and keeping the lexicographically smallest edge list. A concurrent DashMap tracks seen canonical forms so each unique motif is reported exactly once.
 
+### Edge uniqueness
+
+Each ordered node pair (nodeA → nodeB) can appear at most once in a motif's edge list. A second edge between the same ordered pair (with a different hash) would represent an over-specified, artifact constraint and is suppressed during DFS growth.
+
 ### IDF scoring
 
 After DFS, Foldmine computes three scores for each discovered motif:
@@ -199,6 +238,18 @@ After DFS, Foldmine computes three scores for each discovered motif:
 | `adj_idf` | `motif_idf × (mean_nres + 1)^(−0.5)` | Length-penalized IDF.  Penalizes motifs found primarily in large multi-domain proteins (which incidentally contain many structural patterns). |
 
 The output is sorted by `adj_idf` descending (highest specificity first).  Use `--min-idf` to hard-filter low-scoring, generic motifs (alpha-helix contacts typically score < 0.5; specific active-site geometry typically scores > 2.0).
+
+### Residue annotation
+
+After mining, Foldmine attempts to annotate each representative ("top") structure with the actual residue positions (PDB serial numbers) that realise the motif.  The process:
+
+1. Load the structure file from the path stored in the index lookup table.
+2. Scan all ordered residue pairs within 20 Å Cα–Cα distance and compute their geometric hashes.
+3. Collect candidate (residue_i, residue_j) pairs for each motif edge hash.
+4. Run a backtracking constraint solver (rarest edges first for pruning efficiency) to find a consistent, injective assignment of abstract motif nodes to actual residues.
+5. Report PDB serial numbers for the assigned residues.
+
+This step requires the original structure files to be accessible.  If they are not, annotation is silently skipped and only bare structure names are shown.
 
 ### Parallelism
 

@@ -666,8 +666,14 @@ fn bt_assign(
 /// and find the actual residue positions that realise the motif.
 ///
 /// Structures are cached by file path so each unique structure is loaded at
-/// most once.  Failures (missing file, no match found) produce an empty Vec
-/// in `top_structure_residues`.
+/// most once.  If a structure file is missing or unreadable, the motif's
+/// `top_structure_residues` entry for that structure is left empty and the
+/// bare structure name is shown in the output (no error is printed).
+///
+/// **Residue annotation requires the original structure files to be
+/// accessible at the paths stored in the index lookup table.**  When the
+/// index was built on a different machine or the files have been moved,
+/// annotation is silently skipped and only bare names are shown.
 pub fn annotate_top_structures(
     motifs: &mut [FrequentMotif],
     lookup: &[(String, usize, usize, f32, usize)],
@@ -675,7 +681,7 @@ pub fn annotate_top_structures(
     nbin_dist: usize,
     nbin_angle: usize,
 ) {
-    // LRU-style cache keyed on file path.
+    // Cache keyed on file path: Some(structure) if loaded OK, None if unavailable.
     let mut cache: HashMap<String, Option<CompactStructure>> = HashMap::new();
 
     for motif in motifs.iter_mut() {
@@ -688,7 +694,19 @@ pub fn annotate_top_structures(
                 }
                 let path = lookup[id].0.clone();
                 let entry = cache.entry(path.clone()).or_insert_with(|| {
-                    read_compact_structure(&path).ok().map(|(c, _)| c)
+                    // Guard: avoid calling read_compact_structure when the file
+                    // does not exist — that function uses .expect() internally
+                    // and would panic rather than returning Err.
+                    if !std::path::Path::new(&path).exists() {
+                        return None;
+                    }
+                    // std::panic::catch_unwind guards against unexpected panics
+                    // (e.g., corrupted files, unsupported format) so that a
+                    // single bad file does not abort the entire annotation pass.
+                    std::panic::catch_unwind(|| {
+                        read_compact_structure(&path).ok().map(|(c, _)| c)
+                    })
+                    .unwrap_or(None)
                 });
                 match entry {
                     Some(compact) => find_motif_residues(
