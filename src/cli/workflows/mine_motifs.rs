@@ -26,6 +26,7 @@ mining options:
     --max-residues <INT>         Maximum residues per motif [default: 6]
     --max-seeds <INT>            Limit number of seed edges considered (0=unlimited) [default: 0]
     --max-results <INT>          Stop after finding this many motifs (0=unlimited) [default: 0]
+    --min-idf <FLOAT>            Minimum length-adjusted IDF score to include (0=no filter) [default: 0]
 
 output:
     -o, --output <PATH>          Output TSV path (default: stdout)
@@ -36,11 +37,14 @@ general options:
     -h, --help                   Print this help menu
 
 output columns:
-    motif_id      sequential integer
+    motif_id      sequential integer (sorted by adj_idf descending)
     num_residues  number of abstract residue positions in the motif
     num_edges     number of pairwise geometric constraints
     support       fraction of database structures containing the motif
     count         absolute count of matching structures
+    motif_idf     sum of per-edge IDF scores: Σ log2(N / hash_count)
+    mean_nres     mean residue count of matching structures (estimated)
+    adj_idf       length-adjusted IDF: motif_idf × (mean_nres + 1)^(-0.5)
     edges         semicolon-separated edge descriptions:
                   nodeA-nodeB:hash_hex:AA1/AA2/ca_dist/cb_dist/angle[/phi1/phi2]
     top_structures top-5 example structure names
@@ -55,6 +59,7 @@ pub fn mine_motifs(env: AppArgs) {
             max_residues,
             max_seeds,
             max_results,
+            min_idf,
             output,
             threads,
             verbose,
@@ -129,6 +134,7 @@ pub fn mine_motifs(env: AppArgs) {
                 max_seeds,
                 max_results,
                 threads,
+                min_idf,
             };
 
             // Run the algorithm.

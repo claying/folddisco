@@ -39,6 +39,7 @@ folddisco foldmine -i <index_prefix> [options]
 | `--max-residues <INT>` | `6` | Maximum number of abstract residue positions per motif. |
 | `--max-seeds <INT>` | `0` (unlimited) | Limit the number of seed edges explored (rarest first). Useful for very large or dense indices where full exploration is expensive. |
 | `--max-results <INT>` | `0` (unlimited) | Stop after discovering this many motifs. |
+| `--min-idf <FLOAT>` | `0.0` (no filter) | Minimum length-adjusted IDF score (`adj_idf`).  Filters out generic/trivial motifs such as alpha-helix contacts. Typical values: 0.5–2.0. |
 
 ### Output options
 
@@ -61,23 +62,26 @@ folddisco foldmine -i <index_prefix> [options]
 Tab-separated with header:
 
 ```
-motif_id  num_residues  num_edges  support  count  edges  top_structures
+motif_id  num_residues  num_edges  support  count  motif_idf  mean_nres  adj_idf  edges  top_structures
 ```
 
 | Column | Description |
 |--------|-------------|
-| `motif_id` | Sequential integer (sorted by support descending, then edges ascending) |
+| `motif_id` | Sequential integer (sorted by `adj_idf` descending, then support descending, then edges ascending) |
 | `num_residues` | Number of abstract residue positions in the motif |
 | `num_edges` | Number of pairwise geometric constraints |
 | `support` | Fraction of database structures containing the motif |
 | `count` | Absolute count of matching structures |
+| `motif_idf` | Inverse document frequency: Σ log₂(N / hash\_count) over all edges.  Higher = rarer hash combination. |
+| `mean_nres` | Mean residue count of matching structures (estimated from up to 5 representative hits). |
+| `adj_idf` | Length-adjusted IDF: `motif_idf × (mean_nres + 1)^(−0.5)`.  Penalizes motifs found only in large multi-domain proteins.  Use this column to rank and filter. |
 | `edges` | Semicolon-separated edge descriptions: `nodeA-nodeB:hash_hex:AA1/AA2/ca_dist_Å/cb_dist_Å/angle°[/phi1°/phi2°]` |
 | `top_structures` | Comma-separated names of up to 5 representative matching structures |
 
 ### Example row (2-residue, 1-edge motif)
 
 ```
-0	2	1	0.4000	2	0-1:00013d8b:SER/HIS/6.82/8.23/-113.2/-101.3/-144.5	data/sp/1pq5.pdb,data/sp/4cha.pdb
+0	2	1	0.4000	2	8.3214	312.5	0.4706	0-1:00013d8b:SER/HIS/6.82/8.23/-113.2/-101.3/-144.5	data/sp/1pq5.pdb,data/sp/4cha.pdb
 ```
 
 ---
@@ -133,12 +137,13 @@ lz4 -dc afdb_swissprot_v4_folddisco.tar.lz4 | tar -xvf -
 cd ..
 
 # Mine motifs present in ≥ 1 % of Swiss-Prot structures, ≤ 3 residues,
-# using 8 threads, limited to top 10 000 motifs
+# using 8 threads, limited to top 10 000 motifs, filtering trivial helices/sheets
 folddisco foldmine -i index/afdb_swissprot_v4_folddisco \
     --min-support 0.01 --max-freq 0.5 \
     --max-residues 3 \
     --max-seeds 5000 \
     --max-results 10000 \
+    --min-idf 1.0 \
     -t 8 \
     -o swissprot_motifs.tsv -v
 ```
@@ -183,8 +188,21 @@ If a single-edge motif with hash *h* appears in fewer than `min_support × N` st
 
 Two abstract motif graphs that differ only by relabeling their residue positions (nodes) represent the same structural pattern. Foldmine normalizes every motif by trying all *n*! node-label permutations (at most 6! = 720 for `--max-residues 6`) and keeping the lexicographically smallest edge list. A concurrent DashMap tracks seen canonical forms so each unique motif is reported exactly once.
 
+### IDF scoring
+
+After DFS, Foldmine computes three scores for each discovered motif:
+
+| Score | Formula | Meaning |
+|-------|---------|---------|
+| `motif_idf` | Σ log₂(N / count_i) over all edges | Sum of per-edge inverse document frequencies.  Rarer hash combinations → higher score. |
+| `mean_nres` | mean(residues of matching structures) | Average protein length among matching hits.  Estimated from up to 5 representative structures. |
+| `adj_idf` | `motif_idf × (mean_nres + 1)^(−0.5)` | Length-penalized IDF.  Penalizes motifs found primarily in large multi-domain proteins (which incidentally contain many structural patterns). |
+
+The output is sorted by `adj_idf` descending (highest specificity first).  Use `--min-idf` to hard-filter low-scoring, generic motifs (alpha-helix contacts typically score < 0.5; specific active-site geometry typically scores > 2.0).
+
 ### Parallelism
 
 - **Seed-level**: each frequent seed edge launches an independent DFS branch (`rayon::par_iter`).
+- **Work-stealing DFS**: at shallow depths (< 2), candidates are spawned as rayon tasks so that unbalanced DFS trees distribute naturally across idle threads.
 - **Shared state**: the `seen` DashMap and result vector are shared across threads with lock-free / mutex-based access respectively.
 - The `-t` flag controls the rayon thread pool size.

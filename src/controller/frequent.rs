@@ -29,6 +29,7 @@
 //      Intersection becomes a bitwise AND across u64 words (~64× faster),
 //      with SIMD auto-vectorisation exploited by the compiler.
 
+use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Mutex,
@@ -90,6 +91,12 @@ pub struct FrequentMotif {
     pub count: usize,
     /// Up to TOP_K_STRUCTURES structure IDs.
     pub top_structure_ids: Vec<usize>,
+    /// Inverse document frequency: Σ log2(N / hash_count_i) over all edges.
+    pub motif_idf: f32,
+    /// Mean residue count of matching structures (estimated from top_structure_ids).
+    pub mean_nres: f32,
+    /// Length-adjusted IDF: motif_idf × (mean_nres + 1)^(-0.5).
+    pub adj_idf: f32,
 }
 
 /// Configuration for the mining algorithm.
@@ -108,6 +115,8 @@ pub struct MiningConfig {
     pub max_results: usize,
     /// Number of threads.
     pub threads: usize,
+    /// Minimum adj_idf score to include in output.  0.0 = no filter.
+    pub min_idf: f32,
 }
 
 // ---------------------------------------------------------------------------
@@ -341,6 +350,9 @@ fn dfs_grow(
         support,
         count,
         top_structure_ids,
+        motif_idf: 0.0,
+        mean_nres: 0.0,
+        adj_idf: 0.0,
     });
 
     // Check extension limits.
@@ -589,12 +601,53 @@ pub fn mine_frequent_motifs(
     });
 
     let mut output = results.into_inner().unwrap();
+
+    // Phase 3: compute IDF scores for every motif.
+    // Build hash → document-count map from seeds (already have ids.len()).
+    let hash_count_map: HashMap<u32, usize> =
+        seeds.iter().map(|s| (s.hash, s.ids.len())).collect();
+
+    for m in &mut output {
+        // motif_idf: Σ log2(N / hash_count_i) over all edges.
+        m.motif_idf = m
+            .motif
+            .edges
+            .iter()
+            .map(|e| {
+                let c = hash_count_map.get(&e.hash).copied().unwrap_or(1);
+                (total as f32 / c as f32).log2().max(0.0)
+            })
+            .sum();
+
+        // mean_nres: estimated from top_structure_ids (≤ TOP_K_STRUCTURES sample).
+        if !m.top_structure_ids.is_empty() {
+            let sum_nres: f32 = m
+                .top_structure_ids
+                .iter()
+                .filter_map(|&id| lookup.get(id).map(|e| e.2 as f32))
+                .sum();
+            m.mean_nres = sum_nres / m.top_structure_ids.len() as f32;
+        }
+
+        // adj_idf: length-penalized score (length penalty exponent = 0.5).
+        m.adj_idf = m.motif_idf * (m.mean_nres + 1.0).powf(-0.5);
+    }
+
+    // Apply min_idf filter.
+    if config.min_idf > 0.0 {
+        output.retain(|m| m.adj_idf >= config.min_idf);
+    }
+
+    // Sort: adj_idf descending → support descending → fewer edges first.
     output.sort_by(|a, b| {
-        b.support
-            .partial_cmp(&a.support)
+        b.adj_idf
+            .partial_cmp(&a.adj_idf)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then(b.support.partial_cmp(&a.support).unwrap_or(std::cmp::Ordering::Equal))
             .then(a.motif.edges.len().cmp(&b.motif.edges.len()))
     });
+
+    // Reassign motif_id in final sorted order.
     for (i, r) in output.iter_mut().enumerate() {
         r.motif_id = i;
     }
@@ -643,12 +696,15 @@ pub fn format_motif_tsv_row(
         .filter_map(|&id| lookup.get(id).map(|(name, ..)| name.clone()))
         .collect();
     format!(
-        "{}\t{}\t{}\t{:.4}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.1}\t{:.4}\t{}\t{}",
         motif.motif_id,
         motif.motif.num_nodes,
         motif.motif.edges.len(),
         motif.support,
         motif.count,
+        motif.motif_idf,
+        motif.mean_nres,
+        motif.adj_idf,
         edge_strs.join(";"),
         top_names.join(","),
     )
@@ -662,7 +718,7 @@ pub fn write_results<W: std::io::Write>(
     nbin_angle: usize,
     lookup: &[(String, usize, usize, f32, usize)],
 ) -> std::io::Result<()> {
-    writeln!(writer, "motif_id\tnum_residues\tnum_edges\tsupport\tcount\tedges\ttop_structures")?;
+    writeln!(writer, "motif_id\tnum_residues\tnum_edges\tsupport\tcount\tmotif_idf\tmean_nres\tadj_idf\tedges\ttop_structures")?;
     for motif in results {
         writeln!(writer, "{}", format_motif_tsv_row(motif, hash_type, nbin_dist, nbin_angle, lookup))?;
     }

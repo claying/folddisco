@@ -134,6 +134,7 @@ pub enum AppArgs {
         max_residues: usize,
         max_seeds: usize,
         max_results: usize,
+        min_idf: f32,
         output: Option<String>,
         threads: usize,
         verbose: bool,

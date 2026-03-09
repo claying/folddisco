@@ -137,6 +137,7 @@ fn parse_arg() -> Result<AppArgs, Box<dyn std::error::Error>> {
             max_residues: args.value_from_str("--max-residues").unwrap_or(6usize),
             max_seeds: args.value_from_str("--max-seeds").unwrap_or(0usize),
             max_results: args.value_from_str("--max-results").unwrap_or(0usize),
+            min_idf: args.value_from_str("--min-idf").unwrap_or(0.0f32),
             output: args.opt_value_from_str(["-o", "--output"])?,
             threads: args.value_from_str(["-t", "--threads"]).unwrap_or(1usize),
             verbose: args.contains(["-v", "--verbose"]),
