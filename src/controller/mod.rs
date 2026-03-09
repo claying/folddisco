@@ -7,6 +7,7 @@
 
 pub mod feature;
 pub mod filter;
+pub mod frequent;
 pub mod graph;
 pub mod io;
 pub mod query;

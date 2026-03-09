@@ -127,6 +127,18 @@ pub enum AppArgs {
         index_path: String,
         verbose: bool,
     },
+    Mine {
+        index_path: Option<String>,
+        min_support: f32,
+        max_freq: f32,
+        max_residues: usize,
+        max_seeds: usize,
+        max_results: usize,
+        output: Option<String>,
+        threads: usize,
+        verbose: bool,
+        help: bool,
+    },
 }
 
 pub fn print_logo() {

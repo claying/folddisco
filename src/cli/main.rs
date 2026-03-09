@@ -6,7 +6,7 @@
 //! Main entry point for Folddisco CLI
 
 // use crate::*;
-use folddisco::cli::{workflows::{build_index, benchmark, query_pdb}, *};
+use folddisco::cli::{workflows::{build_index, benchmark, query_pdb, mine_motifs}, *};
 
 const VERSION_STRING: &str = env!("FOLDDISCO_BUILD_VERSION");
 const HELP: &str = "\
@@ -17,6 +17,7 @@ subcommands:
   query     Query a motif from an index table
   benchmark Benchmark the performance of folddisco
   analyze   Analyze the distribution of encodings in the index
+  foldmine  Mine frequent structural motifs from an index (Foldmine)
   version   Print version information
 
 options:
@@ -129,6 +130,18 @@ fn parse_arg() -> Result<AppArgs, Box<dyn std::error::Error>> {
             index_path: args.value_from_str(["-i", "--index"])?,
             verbose: args.contains(["-v", "--verbose"]),
         }),
+        Some("foldmine") => Ok(AppArgs::Mine {
+            index_path: args.opt_value_from_str(["-i", "--index"])?,
+            min_support: args.value_from_str("--min-support").unwrap_or(0.01f32),
+            max_freq: args.value_from_str("--max-freq").unwrap_or(0.5f32),
+            max_residues: args.value_from_str("--max-residues").unwrap_or(6usize),
+            max_seeds: args.value_from_str("--max-seeds").unwrap_or(0usize),
+            max_results: args.value_from_str("--max-results").unwrap_or(0usize),
+            output: args.opt_value_from_str(["-o", "--output"])?,
+            threads: args.value_from_str(["-t", "--threads"]).unwrap_or(1usize),
+            verbose: args.contains(["-v", "--verbose"]),
+            help: args.contains(["-h", "--help"]),
+        }),
         Some("version") => {
             println!("{}", VERSION_STRING);
             std::process::exit(0);
@@ -180,6 +193,14 @@ fn main() {
         AppArgs::Test { .. } => {
             println!("Testing");
             // temp::query_test_for_swissprot(parsed_args);
+        }
+        AppArgs::Mine { help, .. } => {
+            if help {
+                print_logo();
+                eprintln!("{}", workflows::mine_motifs::HELP_MINE);
+            } else {
+                mine_motifs::mine_motifs(parsed_args);
+            }
         }
     }
 }
