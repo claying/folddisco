@@ -130,7 +130,7 @@ fn parse_arg() -> Result<AppArgs, Box<dyn std::error::Error>> {
             index_path: args.value_from_str(["-i", "--index"])?,
             verbose: args.contains(["-v", "--verbose"]),
         }),
-        Some("foldmine") => Ok(AppArgs::Mine {
+        Some("mine") => Ok(AppArgs::Mine {
             index_path: args.opt_value_from_str(["-i", "--index"])?,
             min_support: args.value_from_str("--min-support").unwrap_or(0.01f32),
             max_freq: args.value_from_str("--max-freq").unwrap_or(0.5f32),

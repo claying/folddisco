@@ -29,7 +29,7 @@
 //      Intersection becomes a bitwise AND across u64 words (~64× faster),
 //      with SIMD auto-vectorisation exploited by the compiler.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Mutex,
@@ -38,8 +38,11 @@ use std::sync::{
 use dashmap::DashMap;
 use rayon::prelude::*;
 
+use crate::controller::feature::get_single_feature;
+use crate::controller::io::read_compact_structure;
 use crate::geometry::core::{GeometricHash, HashType};
 use crate::index::indextable::FolddiscoIndex;
+use crate::structure::core::CompactStructure;
 use crate::utils::convert::map_u8_to_aa;
 
 // ---------------------------------------------------------------------------
@@ -91,6 +94,10 @@ pub struct FrequentMotif {
     pub count: usize,
     /// Up to TOP_K_STRUCTURES structure IDs.
     pub top_structure_ids: Vec<usize>,
+    /// Residue indices (PDB serial numbers) for each top structure, one per motif node.
+    /// `top_structure_residues[i]` corresponds to `top_structure_ids[i]`.
+    /// An empty inner Vec means annotation failed for that structure.
+    pub top_structure_residues: Vec<Vec<usize>>,
     /// Inverse document frequency: Σ log2(N / hash_count_i) over all edges.
     pub motif_idf: f32,
     /// Mean residue count of matching structures (estimated from top_structure_ids).
@@ -350,6 +357,7 @@ fn dfs_grow(
         support,
         count,
         top_structure_ids,
+        top_structure_residues: Vec::new(), // filled in by annotate_top_structures()
         motif_idf: 0.0,
         mean_nres: 0.0,
         adj_idf: 0.0,
@@ -442,7 +450,12 @@ fn dfs_grow(
                         continue;
                     }
                     let edge = MotifEdge { node_a, node_b, hash: seed.hash };
-                    if motif.edges.contains(&edge) {
+                    // Prevent adding a second edge in the same direction between
+                    // a node pair that already has one (regardless of hash).
+                    // Without this, the same "0-1" pair can appear multiple times
+                    // in a motif's edge list with different hash values — an
+                    // over-specified, artifact constraint.
+                    if motif.edges.iter().any(|e| e.node_a == edge.node_a && e.node_b == edge.node_b) {
                         continue;
                     }
                     let mut edges = motif.edges.clone();
@@ -515,6 +528,180 @@ fn dfs_grow(
                 });
             }
         });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Residue annotation helpers
+// ---------------------------------------------------------------------------
+
+/// CA–CA distance cutoff used when scanning a structure for hash matches.
+const HASH_DIST_CUTOFF: f32 = 20.0;
+
+/// Maximum candidates per edge before truncation (bounds backtracking cost).
+const MAX_CANDIDATES: usize = 500;
+
+/// Given a loaded `CompactStructure` and a `MotifGraph`, find the first
+/// consistent assignment of motif nodes to actual residues in the structure.
+///
+/// Returns a `Vec<usize>` of PDB residue serial numbers, one per abstract
+/// node (index 0..motif.num_nodes-1), or an empty Vec if no match is found.
+fn find_motif_residues(
+    compact: &CompactStructure,
+    motif: &MotifGraph,
+    hash_type: HashType,
+    nbin_dist: usize,
+    nbin_angle: usize,
+) -> Vec<usize> {
+    let n = motif.num_nodes as usize;
+    let target_hashes: HashSet<u32> = motif.edges.iter().map(|e| e.hash).collect();
+
+    // Single pass over all ordered residue pairs to collect candidates.
+    let mut hash_to_pairs: HashMap<u32, Vec<(usize, usize)>> = HashMap::new();
+    let mut feature = vec![0.0f32; 16];
+
+    for i in 0..compact.num_residues {
+        for j in 0..compact.num_residues {
+            if i == j {
+                continue;
+            }
+            let Some(ca_dist) = compact.get_ca_distance(i, j) else {
+                continue;
+            };
+            if ca_dist > HASH_DIST_CUTOFF {
+                continue;
+            }
+            if !get_single_feature(i, j, compact, hash_type, HASH_DIST_CUTOFF, &mut feature) {
+                continue;
+            }
+            let h = GeometricHash::perfect_hash_as_u32(&feature, hash_type, nbin_dist, nbin_angle);
+            if target_hashes.contains(&h) {
+                let pairs = hash_to_pairs.entry(h).or_default();
+                if pairs.len() < MAX_CANDIDATES {
+                    pairs.push((i, j));
+                }
+            }
+        }
+    }
+
+    // Sort edge processing order: rarest hash first (fewest candidates) for
+    // maximum pruning efficiency in the backtracking search.
+    let empty: Vec<(usize, usize)> = Vec::new();
+    let mut order: Vec<usize> = (0..motif.edges.len()).collect();
+    order.sort_by_key(|&ei| {
+        hash_to_pairs.get(&motif.edges[ei].hash).map(|v| v.len()).unwrap_or(0)
+    });
+
+    let ordered_edges: Vec<&MotifEdge> =
+        order.iter().map(|&ei| &motif.edges[ei]).collect();
+    let ordered_cands: Vec<&[(usize, usize)]> = order
+        .iter()
+        .map(|&ei| {
+            hash_to_pairs
+                .get(&motif.edges[ei].hash)
+                .map(|v| v.as_slice())
+                .unwrap_or(empty.as_slice())
+        })
+        .collect();
+
+    // Backtracking search — assignment[i] = structure residue index for node i.
+    let mut assignment = vec![usize::MAX; n];
+    if bt_assign(&ordered_edges, &ordered_cands, &mut assignment, 0, n) {
+        // Convert 0-based residue array indices to PDB serial numbers.
+        assignment
+            .iter()
+            .map(|&idx| compact.residue_serial[idx] as usize)
+            .collect()
+    } else {
+        vec![]
+    }
+}
+
+/// Backtracking constraint solver: assigns a unique structure residue to each
+/// motif node such that every edge constraint is satisfied.
+///
+/// `edges` and `cands` are parallel slices, both ordered rarest-first.
+/// `assignment[k] == usize::MAX` means node k is not yet assigned.
+fn bt_assign(
+    edges: &[&MotifEdge],
+    cands: &[&[(usize, usize)]],
+    assignment: &mut Vec<usize>,
+    ei: usize,
+    n: usize,
+) -> bool {
+    if ei == edges.len() {
+        // All edges processed; check every node has been assigned.
+        return assignment.iter().take(n).all(|&x| x != usize::MAX);
+    }
+
+    let na = edges[ei].node_a as usize;
+    let nb = edges[ei].node_b as usize;
+    let was_na = assignment[na];
+    let was_nb = assignment[nb];
+
+    for &(ri, rj) in cands[ei] {
+        // Must be consistent with already-fixed nodes.
+        if was_na != usize::MAX && was_na != ri { continue; }
+        if was_nb != usize::MAX && was_nb != rj { continue; }
+        // Residues must be distinct and not already used by another node.
+        if ri == rj { continue; }
+        if (0..n).any(|k| k != na && assignment[k] == ri) { continue; }
+        if (0..n).any(|k| k != nb && assignment[k] == rj) { continue; }
+
+        assignment[na] = ri;
+        assignment[nb] = rj;
+
+        if bt_assign(edges, cands, assignment, ei + 1, n) {
+            return true;
+        }
+
+        // Restore only what this call changed.
+        assignment[na] = was_na;
+        assignment[nb] = was_nb;
+    }
+    false
+}
+
+/// Post-process mined motifs: for each top structure, load the structure file
+/// and find the actual residue positions that realise the motif.
+///
+/// Structures are cached by file path so each unique structure is loaded at
+/// most once.  Failures (missing file, no match found) produce an empty Vec
+/// in `top_structure_residues`.
+pub fn annotate_top_structures(
+    motifs: &mut [FrequentMotif],
+    lookup: &[(String, usize, usize, f32, usize)],
+    hash_type: HashType,
+    nbin_dist: usize,
+    nbin_angle: usize,
+) {
+    // LRU-style cache keyed on file path.
+    let mut cache: HashMap<String, Option<CompactStructure>> = HashMap::new();
+
+    for motif in motifs.iter_mut() {
+        motif.top_structure_residues = motif
+            .top_structure_ids
+            .iter()
+            .map(|&id| {
+                if id >= lookup.len() {
+                    return vec![];
+                }
+                let path = lookup[id].0.clone();
+                let entry = cache.entry(path.clone()).or_insert_with(|| {
+                    read_compact_structure(&path).ok().map(|(c, _)| c)
+                });
+                match entry {
+                    Some(compact) => find_motif_residues(
+                        compact,
+                        &motif.motif,
+                        hash_type,
+                        nbin_dist,
+                        nbin_angle,
+                    ),
+                    None => vec![],
+                }
+            })
+            .collect();
     }
 }
 
@@ -693,7 +880,22 @@ pub fn format_motif_tsv_row(
     let top_names: Vec<String> = motif
         .top_structure_ids
         .iter()
-        .filter_map(|&id| lookup.get(id).map(|(name, ..)| name.clone()))
+        .enumerate()
+        .filter_map(|(pos, &id)| {
+            lookup.get(id).map(|(name, ..)| {
+                match motif.top_structure_residues.get(pos) {
+                    Some(residues) if !residues.is_empty() => {
+                        let res_str = residues
+                            .iter()
+                            .map(|r| r.to_string())
+                            .collect::<Vec<_>>()
+                            .join("-");
+                        format!("{}:{}", name, res_str)
+                    }
+                    _ => name.clone(),
+                }
+            })
+        })
         .collect();
     format!(
         "{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.1}\t{:.4}\t{}\t{}",

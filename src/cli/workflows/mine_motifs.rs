@@ -6,14 +6,14 @@ use std::io::BufWriter;
 
 use crate::cli::{AppArgs, print_logo};
 use crate::cli::config::read_index_config_from_file;
-use crate::controller::frequent::{mine_frequent_motifs, write_results, MiningConfig};
+use crate::controller::frequent::{annotate_top_structures, mine_frequent_motifs, write_results, MiningConfig};
 use crate::controller::io::get_lookup_and_type;
 use crate::index::indextable::load_folddisco_index;
 use crate::index::lookup::load_lookup_from_file;
 use crate::prelude::{print_log_msg, INFO};
 
 pub const HELP_MINE: &str = "\
-usage: folddisco foldmine -i <index_prefix> [options]
+usage: folddisco mine -i <index_prefix> [options]
 
 Foldmine: discover frequent structural motifs in a Folddisco index.
 
@@ -47,7 +47,9 @@ output columns:
     adj_idf       length-adjusted IDF: motif_idf × (mean_nres + 1)^(-0.5)
     edges         semicolon-separated edge descriptions:
                   nodeA-nodeB:hash_hex:AA1/AA2/ca_dist/cb_dist/angle[/phi1/phi2]
-    top_structures top-5 example structure names
+    top_structures top-5 example structures with residue positions:
+                  name:res0-res1-res2-... (PDB serial numbers per motif node)
+                  bare name shown when structure file is unavailable
 ";
 
 pub fn mine_motifs(env: AppArgs) {
@@ -141,14 +143,23 @@ pub fn mine_motifs(env: AppArgs) {
             if verbose {
                 print_log_msg(INFO, "Starting Foldmine...");
             }
-            let results = mine_frequent_motifs(&index, &lookup, &mining_config);
+            let mut results = mine_frequent_motifs(&index, &lookup, &mining_config);
 
             if verbose {
                 print_log_msg(
                     INFO,
                     &format!("Found {} frequent motifs", results.len()),
                 );
+                print_log_msg(INFO, "Annotating top structures with residue positions...");
             }
+
+            annotate_top_structures(
+                &mut results,
+                &lookup,
+                config.hash_type,
+                config.num_bin_dist,
+                config.num_bin_angle,
+            );
 
             // Write output.
             match output {
