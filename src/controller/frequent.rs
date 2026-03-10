@@ -104,6 +104,9 @@ pub struct FrequentMotif {
     pub mean_nres: f32,
     /// Length-adjusted IDF: motif_idf × (mean_nres + 1)^(-0.5).
     pub adj_idf: f32,
+    /// Full sorted structure-ID support list.
+    /// Populated during DFS only when merge_iso_threshold is Some; cleared after merge.
+    pub all_structure_ids: Vec<usize>,
 }
 
 /// Configuration for the mining algorithm.
@@ -139,6 +142,9 @@ pub struct MiningConfig {
     pub num_bin_dist: usize,
     /// Number of angle bins (copied from the index configuration).
     pub num_bin_angle: usize,
+    /// If Some(t), merge motifs whose structure-support sets have Jaccard ≥ t after DFS.
+    /// None = disabled.  Recommended starting value: 0.7.
+    pub merge_iso_threshold: Option<f32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -299,6 +305,25 @@ fn sorted_union_into(a: &[usize], b: &[usize], out: &mut Vec<usize>) {
 }
 
 // ---------------------------------------------------------------------------
+// Non-allocating sorted-list intersection count  (for Jaccard merging)
+// ---------------------------------------------------------------------------
+
+/// Returns |A ∩ B| for two sorted slices, without allocating.
+/// Used by `merge_isomorphic_motifs` to compute Jaccard similarity.
+#[inline]
+fn sorted_intersect_count(a: &[usize], b: &[usize]) -> usize {
+    let (mut i, mut j, mut n) = (0, 0, 0);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Equal   => { n += 1; i += 1; j += 1; }
+            std::cmp::Ordering::Less    => { i += 1; }
+            std::cmp::Ordering::Greater => { j += 1; }
+        }
+    }
+    n
+}
+
+// ---------------------------------------------------------------------------
 // Fully-connected motif check  (--require-complete)
 // ---------------------------------------------------------------------------
 
@@ -319,6 +344,124 @@ fn is_fully_connected(motif: &MotifGraph) -> bool {
         }
     }
     true
+}
+
+// ---------------------------------------------------------------------------
+// Isomorphic motif merging  (--merge-iso)
+// ---------------------------------------------------------------------------
+
+/// Merge motifs whose structure-support sets have Jaccard similarity ≥ `threshold`.
+///
+/// Algorithm:
+/// 1. Group motifs by (num_nodes, num_edges) — only same-shape motifs can be isomorphic.
+/// 2. Within each group, run union-find: union(i, j) when Jaccard(i, j) ≥ threshold.
+/// 3. For each cluster, keep the motif with the highest `count` as representative.
+///    Union all `all_structure_ids`, update count/support/top_structure_ids.
+///    Reset `top_structure_residues` so annotate_top_structures re-annotates correctly.
+/// 4. Retain only cluster representatives; clear `all_structure_ids`.
+fn merge_isomorphic_motifs(results: &mut Vec<FrequentMotif>, total: usize, threshold: f32) {
+    if results.is_empty() {
+        return;
+    }
+
+    // --- Simple path-compressed union-find ---
+    fn find(parent: &mut Vec<usize>, x: usize) -> usize {
+        if parent[x] != x {
+            parent[x] = find(parent, parent[x]);
+        }
+        parent[x]
+    }
+    fn union(parent: &mut Vec<usize>, x: usize, y: usize) {
+        let rx = find(parent, x);
+        let ry = find(parent, y);
+        if rx != ry {
+            parent[ry] = rx; // merge ry → rx
+        }
+    }
+
+    let n = results.len();
+    let mut parent: Vec<usize> = (0..n).collect();
+
+    // Group indices by (num_nodes, num_edges).
+    let mut groups: HashMap<(u8, usize), Vec<usize>> = HashMap::new();
+    for (idx, m) in results.iter().enumerate() {
+        groups
+            .entry((m.motif.num_nodes, m.motif.edges.len()))
+            .or_default()
+            .push(idx);
+    }
+
+    // Pairwise Jaccard within each group.
+    for group in groups.values() {
+        for (ii, &i) in group.iter().enumerate() {
+            for &j in &group[ii + 1..] {
+                let a = &results[i].all_structure_ids;
+                let b = &results[j].all_structure_ids;
+                if a.is_empty() || b.is_empty() {
+                    continue;
+                }
+                let inter = sorted_intersect_count(a, b);
+                let union_sz = a.len() + b.len() - inter;
+                if union_sz > 0 && inter as f32 / union_sz as f32 >= threshold {
+                    union(&mut parent, i, j);
+                }
+            }
+        }
+    }
+
+    // Collect clusters: root → list of member indices.
+    let mut clusters: HashMap<usize, Vec<usize>> = HashMap::new();
+    for i in 0..n {
+        let root = find(&mut parent, i);
+        clusters.entry(root).or_default().push(i);
+    }
+
+    // For singleton clusters, just clear all_structure_ids and move on.
+    // For multi-member clusters, merge into the member with the highest count.
+    let mut keep: Vec<bool> = vec![false; n];
+    let mut merge_buf: Vec<usize> = Vec::new();
+    let mut tmp_buf: Vec<usize> = Vec::new();
+
+    for members in clusters.values() {
+        if members.len() == 1 {
+            let rep = members[0];
+            keep[rep] = true;
+            results[rep].all_structure_ids.clear();
+            continue;
+        }
+
+        // Pick representative = member with highest count.
+        let rep = *members
+            .iter()
+            .max_by_key(|&&m| results[m].count)
+            .unwrap();
+        keep[rep] = true;
+
+        // Union all structure ID lists into merge_buf.
+        // sorted_union_into(a, b, out): we alternate merge_buf / tmp_buf as output.
+        merge_buf.clear();
+        for &m in members {
+            // SAFETY of borrow: merge_buf and tmp_buf are two distinct Vecs.
+            sorted_union_into(merge_buf.as_slice(), &results[m].all_structure_ids, &mut tmp_buf);
+            std::mem::swap(&mut merge_buf, &mut tmp_buf);
+        }
+
+        // Update representative.
+        let merged_count = merge_buf.len();
+        results[rep].count = merged_count;
+        results[rep].support = merged_count as f32 / total as f32;
+        results[rep].top_structure_ids = merge_buf
+            .iter()
+            .take(TOP_K_STRUCTURES)
+            .copied()
+            .collect();
+        results[rep].top_structure_residues = Vec::new(); // re-annotated later
+        results[rep].all_structure_ids.clear();
+    }
+
+    // Retain only representatives.
+    let mut i = 0;
+    results.retain(|_| { let r = keep[i]; i += 1; r });
 }
 
 // ---------------------------------------------------------------------------
@@ -566,6 +709,7 @@ fn dfs_grow(
     results: &Mutex<Vec<FrequentMotif>>,
     counter: &AtomicUsize,
     require_complete: bool,
+    store_all_ids: bool,
     buf_ids: &mut Vec<usize>,
     buf_bits: &mut Vec<u64>,
 ) {
@@ -589,6 +733,11 @@ fn dfs_grow(
         } else {
             current_ids.iter().take(TOP_K_STRUCTURES).copied().collect()
         };
+        let all_structure_ids = if store_all_ids {
+            current_ids.to_vec()
+        } else {
+            Vec::new()
+        };
         let motif_id = counter.fetch_add(1, Ordering::Relaxed);
         results.lock().unwrap().push(FrequentMotif {
             motif_id,
@@ -600,6 +749,7 @@ fn dfs_grow(
             motif_idf: 0.0,
             mean_nres: 0.0,
             adj_idf: 0.0,
+            all_structure_ids,
         });
     }
 
@@ -675,6 +825,7 @@ fn dfs_grow(
                             results,
                             counter,
                             require_complete,
+                            store_all_ids,
                             buf_ids,
                             buf_bits,
                         );
@@ -728,6 +879,7 @@ fn dfs_grow(
                                 results,
                                 counter,
                                 require_complete,
+                                store_all_ids,
                                 buf_ids,
                                 buf_bits,
                             );
@@ -765,6 +917,7 @@ fn dfs_grow(
                         results,
                         counter,
                         require_complete,
+                        store_all_ids,
                         &mut local_buf_ids,
                         &mut local_buf_bits,
                     );
@@ -1054,12 +1207,19 @@ pub fn mine_frequent_motifs(
             &results,
             &counter,
             config.require_complete,
+            config.merge_iso_threshold.is_some(),
             &mut buf_ids,
             &mut buf_bits,
         );
     });
 
     let mut output = results.into_inner().unwrap();
+
+    // Phase 2.5: merge isomorphic motifs (--merge-iso).
+    // Done before IDF scoring so we only compute IDF for surviving merged motifs.
+    if let Some(threshold) = config.merge_iso_threshold {
+        merge_isomorphic_motifs(&mut output, total, threshold);
+    }
 
     // Phase 3: compute IDF scores for every motif.
     // Build hash → document-count map from seeds (already have ids.len()).

@@ -138,6 +138,7 @@ pub enum AppArgs {
         require_complete: bool,
         fuzzy_dist: f32,
         fuzzy_angle: f32,
+        merge_iso_threshold: Option<f32>,
         output: Option<String>,
         threads: usize,
         verbose: bool,

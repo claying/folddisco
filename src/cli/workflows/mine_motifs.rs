@@ -34,6 +34,10 @@ mining options:
                                  0 = exact matching only. Paper default: 0.5 [default: 0]
     --fuzzy-angle <FLOAT>        Angle deviation (degrees) for fuzzy seed expansion.
                                  0 = exact matching only. Paper default: 5.0 [default: 0]
+    --merge-iso <FLOAT>          Merge motifs whose structure-support sets have Jaccard
+                                 similarity ≥ FLOAT. Reduces duplicate/isomorphic entries
+                                 (e.g., same geometric contact encoded from opposite edge
+                                 directions). Recommended: 0.7. [default: off]
 
 output:
     -o, --output <PATH>          Output TSV path (default: stdout)
@@ -72,6 +76,7 @@ pub fn mine_motifs(env: AppArgs) {
             require_complete,
             fuzzy_dist,
             fuzzy_angle,
+            merge_iso_threshold,
             output,
             threads,
             verbose,
@@ -150,6 +155,7 @@ pub fn mine_motifs(env: AppArgs) {
                 require_complete,
                 fuzzy_dist,
                 fuzzy_angle,
+                merge_iso_threshold,
                 hash_type: config.hash_type,
                 num_bin_dist: config.num_bin_dist,
                 num_bin_angle: config.num_bin_angle,

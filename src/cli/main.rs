@@ -141,6 +141,7 @@ fn parse_arg() -> Result<AppArgs, Box<dyn std::error::Error>> {
             require_complete: args.contains("--require-complete"),
             fuzzy_dist: args.value_from_str("--fuzzy-dist").unwrap_or(0.0f32),
             fuzzy_angle: args.value_from_str("--fuzzy-angle").unwrap_or(0.0f32),
+            merge_iso_threshold: args.opt_value_from_str("--merge-iso")?,
             output: args.opt_value_from_str(["-o", "--output"])?,
             threads: args.value_from_str(["-t", "--threads"]).unwrap_or(1usize),
             verbose: args.contains(["-v", "--verbose"]),
