@@ -124,6 +124,21 @@ pub struct MiningConfig {
     pub threads: usize,
     /// Minimum adj_idf score to include in output.  0.0 = no filter.
     pub min_idf: f32,
+    /// Only report motifs where every unordered node pair has ≥1 directed edge
+    /// (fully-connected undirected view).  Default: false.
+    pub require_complete: bool,
+    /// Distance deviation (Å) for fuzzy seed expansion.  0.0 = disabled.
+    /// Paper default: 0.5 Å.
+    pub fuzzy_dist: f32,
+    /// Angle deviation (degrees) for fuzzy seed expansion.  0.0 = disabled.
+    /// Paper default: 5.0°.  Internally converted to radians for sin/cos hash types.
+    pub fuzzy_angle: f32,
+    /// Geometric hash type (copied from the index configuration).
+    pub hash_type: HashType,
+    /// Number of distance bins (copied from the index configuration).
+    pub num_bin_dist: usize,
+    /// Number of angle bins (copied from the index configuration).
+    pub num_bin_angle: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -265,6 +280,137 @@ fn sorted_intersect_into(a: &[usize], b: &[usize], out: &mut Vec<usize>) {
 }
 
 // ---------------------------------------------------------------------------
+// Sorted-list union  (fuzzy seed expansion)
+// ---------------------------------------------------------------------------
+
+#[inline]
+fn sorted_union_into(a: &[usize], b: &[usize], out: &mut Vec<usize>) {
+    out.clear();
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Equal   => { out.push(a[i]); i += 1; j += 1; }
+            std::cmp::Ordering::Less    => { out.push(a[i]); i += 1; }
+            std::cmp::Ordering::Greater => { out.push(b[j]); j += 1; }
+        }
+    }
+    out.extend_from_slice(&a[i..]);
+    out.extend_from_slice(&b[j..]);
+}
+
+// ---------------------------------------------------------------------------
+// Fully-connected motif check  (--require-complete)
+// ---------------------------------------------------------------------------
+
+/// Returns `true` iff every unordered node pair {a, b} in `motif` has at
+/// least one directed edge (a→b or b→a).
+///
+/// A 2-node motif is trivially satisfied.
+fn is_fully_connected(motif: &MotifGraph) -> bool {
+    let n = motif.num_nodes as usize;
+    for a in 0..n {
+        for b in (a + 1)..n {
+            if !motif.edges.iter().any(|e| {
+                (e.node_a as usize == a && e.node_b as usize == b)
+                    || (e.node_a as usize == b && e.node_b as usize == a)
+            }) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+// ---------------------------------------------------------------------------
+// Fuzzy neighbor hash computation  (--fuzzy-dist / --fuzzy-angle)
+// ---------------------------------------------------------------------------
+
+/// Given a hash value, compute all neighbor hashes obtained by independently
+/// applying ±`dev_dist` (Å) to each distance feature and ±`dev_angle` (°) to
+/// each angle feature.
+///
+/// The approach: decode hash → continuous feature values → perturb → re-encode.
+///
+/// **Unit note**: `GeometricHash::reverse_hash` returns angle features in
+/// degrees.  For hash types that encode angles as sin/cos pairs (PDBTrRosetta,
+/// TrRosetta, PDBMotifSinCos), `perfect_hash_as_u32` expects those features
+/// back in *radians*, so we convert before re-encoding.  For types that store
+/// raw degree values (PDBMotif, FolddiscoAngle, FolddiscoDist) no conversion
+/// is necessary.
+fn neighbor_hashes(
+    hash: u32,
+    hash_type: HashType,
+    nbin_dist: usize,
+    nbin_angle: usize,
+    dev_dist: f32,
+    dev_angle_deg: f32,
+) -> Vec<u32> {
+    let gh = GeometricHash::from_u32(hash, hash_type);
+    let mut decoded = vec![0.0f32; 16];
+    gh.reverse_hash(nbin_dist, nbin_angle, &mut decoded);
+    // decoded[0,1] = amino acid indices (categorical — do not perturb).
+    // decoded[2,3] = distance features (Å).
+    // decoded[4..] = angle features (degrees from reverse_hash).
+
+    // Hash types that use sin/cos encoding need angles in radians for re-encoding.
+    let angle_to_rad = matches!(
+        hash_type,
+        HashType::PDBTrRosetta | HashType::TrRosetta | HashType::PDBMotifSinCos
+    );
+
+    // Build the base feature vector in the units expected by perfect_hash_as_u32.
+    let mut feat_base = decoded.clone();
+    if angle_to_rad {
+        for slot in feat_base[4..7].iter_mut() {
+            *slot = slot.to_radians();
+        }
+    }
+
+    // Deviation in the units used by perfect_hash_as_u32.
+    let dev_angle_enc = if angle_to_rad {
+        dev_angle_deg.to_radians()
+    } else {
+        dev_angle_deg
+    };
+
+    let mut out = vec![hash];
+
+    // Perturb distance features (indices 2, 3).
+    if dev_dist > 0.0 {
+        for idx in [2usize, 3] {
+            for &dev in &[dev_dist, -dev_dist] {
+                let mut f = feat_base.clone();
+                f[idx] += dev;
+                out.push(GeometricHash::perfect_hash_as_u32(
+                    &f, hash_type, nbin_dist, nbin_angle,
+                ));
+            }
+        }
+    }
+
+    // Perturb angle features (indices 4, 5, 6 — skip if both decoded and
+    // encoded values are zero, indicating an unused feature slot).
+    if dev_angle_enc > 0.0 {
+        for idx in [4usize, 5, 6] {
+            if decoded[idx] == 0.0 && feat_base[idx] == 0.0 {
+                continue;
+            }
+            for &dev in &[dev_angle_enc, -dev_angle_enc] {
+                let mut f = feat_base.clone();
+                f[idx] += dev;
+                out.push(GeometricHash::perfect_hash_as_u32(
+                    &f, hash_type, nbin_dist, nbin_angle,
+                ));
+            }
+        }
+    }
+
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Seed collection
 // ---------------------------------------------------------------------------
 
@@ -273,10 +419,16 @@ fn collect_seeds(
     min_count: usize,
     max_count: usize,
     total: usize,
+    hash_type: HashType,
+    nbin_dist: usize,
+    nbin_angle: usize,
+    fuzzy_dist: f32,
+    fuzzy_angle: f32,
 ) -> Vec<Seed> {
     let n = index.total_hashes;
     let n_words = total.div_ceil(64);
     let use_bits = total >= BITSET_THRESHOLD;
+    let do_fuzzy = fuzzy_dist > 0.0 || fuzzy_angle > 0.0;
 
     (0..n)
         .into_par_iter()
@@ -290,7 +442,26 @@ fn collect_seeds(
             if byte_span < min_count {
                 return None;
             }
-            let ids = index.get_entries(h);
+            let mut ids = index.get_entries(h);
+
+            // Fuzzy expansion: union in structure IDs from neighboring hashes.
+            if do_fuzzy {
+                let nbrs = neighbor_hashes(
+                    h, hash_type, nbin_dist, nbin_angle, fuzzy_dist, fuzzy_angle,
+                );
+                let mut buf = Vec::new();
+                for nbr_h in nbrs {
+                    if nbr_h == h {
+                        continue;
+                    }
+                    let nbr_ids = index.get_entries(nbr_h);
+                    if !nbr_ids.is_empty() {
+                        sorted_union_into(&ids, &nbr_ids, &mut buf);
+                        std::mem::swap(&mut ids, &mut buf);
+                    }
+                }
+            }
+
             let df = ids.len();
             if df >= min_count && df <= max_count {
                 let bits = use_bits.then(|| ids_to_bitset(&ids, n_words));
@@ -329,10 +500,11 @@ fn dfs_grow(
     seen: &DashMap<CanonicalMotif, ()>,
     results: &Mutex<Vec<FrequentMotif>>,
     counter: &AtomicUsize,
+    require_complete: bool,
     buf_ids: &mut Vec<usize>,
     buf_bits: &mut Vec<u64>,
 ) {
-    // Early exit if result limit reached.
+    // Early exit if result limit reached (counts only motifs actually recorded).
     if max_results > 0 && counter.load(Ordering::Relaxed) >= max_results {
         return;
     }
@@ -342,26 +514,29 @@ fn dfs_grow(
         return; // already processed by another thread
     }
 
-    // Record this motif.
-    let count = current_ids.len();
-    let support = count as f32 / total as f32;
-    let top_structure_ids: Vec<usize> = if let Some(cb) = current_bits {
-        bitset_first_k(cb, TOP_K_STRUCTURES)
-    } else {
-        current_ids.iter().take(TOP_K_STRUCTURES).copied().collect()
-    };
-    let motif_id = counter.fetch_add(1, Ordering::Relaxed);
-    results.lock().unwrap().push(FrequentMotif {
-        motif_id,
-        motif: canonical,
-        support,
-        count,
-        top_structure_ids,
-        top_structure_residues: Vec::new(), // filled in by annotate_top_structures()
-        motif_idf: 0.0,
-        mean_nres: 0.0,
-        adj_idf: 0.0,
-    });
+    // Record this motif — skipped when --require-complete is on and the
+    // motif graph is not fully connected (every unordered pair has ≥1 edge).
+    if !require_complete || is_fully_connected(&canonical) {
+        let count = current_ids.len();
+        let support = count as f32 / total as f32;
+        let top_structure_ids: Vec<usize> = if let Some(cb) = current_bits {
+            bitset_first_k(cb, TOP_K_STRUCTURES)
+        } else {
+            current_ids.iter().take(TOP_K_STRUCTURES).copied().collect()
+        };
+        let motif_id = counter.fetch_add(1, Ordering::Relaxed);
+        results.lock().unwrap().push(FrequentMotif {
+            motif_id,
+            motif: canonical,
+            support,
+            count,
+            top_structure_ids,
+            top_structure_residues: Vec::new(), // filled in by annotate_top_structures()
+            motif_idf: 0.0,
+            mean_nres: 0.0,
+            adj_idf: 0.0,
+        });
+    }
 
     // Check extension limits.
     let at_node_limit = motif.num_nodes >= max_nodes;
@@ -434,6 +609,7 @@ fn dfs_grow(
                             seen,
                             results,
                             counter,
+                            require_complete,
                             buf_ids,
                             buf_bits,
                         );
@@ -486,6 +662,7 @@ fn dfs_grow(
                                 seen,
                                 results,
                                 counter,
+                                require_complete,
                                 buf_ids,
                                 buf_bits,
                             );
@@ -522,6 +699,7 @@ fn dfs_grow(
                         seen,
                         results,
                         counter,
+                        require_complete,
                         &mut local_buf_ids,
                         &mut local_buf_bits,
                     );
@@ -749,7 +927,17 @@ pub fn mine_frequent_motifs(
     }
 
     // Phase 1: collect frequent single-edge seeds.
-    let mut seeds = collect_seeds(index, min_count, max_count, total);
+    let mut seeds = collect_seeds(
+        index,
+        min_count,
+        max_count,
+        total,
+        config.hash_type,
+        config.num_bin_dist,
+        config.num_bin_angle,
+        config.fuzzy_dist,
+        config.fuzzy_angle,
+    );
     seeds.sort_by_key(|s| s.ids.len()); // rarest first
 
     if seeds.is_empty() {
@@ -800,6 +988,7 @@ pub fn mine_frequent_motifs(
             &seen,
             &results,
             &counter,
+            config.require_complete,
             &mut buf_ids,
             &mut buf_bits,
         );
@@ -1028,5 +1217,91 @@ mod tests {
         let bits = ids_to_bitset(&ids, n_words);
         let top3 = bitset_first_k(&bits, 3);
         assert_eq!(top3, vec![0usize, 1, 2]);
+    }
+
+    #[test]
+    fn test_sorted_union_into() {
+        let a = vec![1usize, 3, 5, 7];
+        let b = vec![2usize, 3, 6, 7, 8];
+        let mut out = Vec::new();
+        sorted_union_into(&a, &b, &mut out);
+        assert_eq!(out, vec![1, 2, 3, 5, 6, 7, 8]);
+
+        // Union with empty
+        let mut out2 = Vec::new();
+        sorted_union_into(&a, &[], &mut out2);
+        assert_eq!(out2, a);
+
+        sorted_union_into(&[], &b, &mut out2);
+        assert_eq!(out2, b);
+    }
+
+    #[test]
+    fn test_is_fully_connected() {
+        // 2-node motif: always connected
+        let m2 = MotifGraph {
+            num_nodes: 2,
+            edges: vec![MotifEdge { node_a: 0, node_b: 1, hash: 1 }],
+        };
+        assert!(is_fully_connected(&m2));
+
+        // 3-node motif: triangle (all pairs covered)
+        let m3_full = MotifGraph {
+            num_nodes: 3,
+            edges: vec![
+                MotifEdge { node_a: 0, node_b: 1, hash: 1 },
+                MotifEdge { node_a: 1, node_b: 2, hash: 2 },
+                MotifEdge { node_a: 0, node_b: 2, hash: 3 },
+            ],
+        };
+        assert!(is_fully_connected(&m3_full));
+
+        // 3-node motif: path (pair {0,2} missing)
+        let m3_path = MotifGraph {
+            num_nodes: 3,
+            edges: vec![
+                MotifEdge { node_a: 0, node_b: 1, hash: 1 },
+                MotifEdge { node_a: 1, node_b: 2, hash: 2 },
+            ],
+        };
+        assert!(!is_fully_connected(&m3_path));
+
+        // 3-node motif: reverse direction counts as covering the pair
+        let m3_rev = MotifGraph {
+            num_nodes: 3,
+            edges: vec![
+                MotifEdge { node_a: 0, node_b: 1, hash: 1 },
+                MotifEdge { node_a: 1, node_b: 2, hash: 2 },
+                MotifEdge { node_a: 2, node_b: 0, hash: 3 }, // covers {0,2} via 2→0
+            ],
+        };
+        assert!(is_fully_connected(&m3_rev));
+    }
+
+    #[test]
+    fn test_neighbor_hashes_returns_original() {
+        use crate::geometry::core::HashType;
+        // With zero deviations, neighbor_hashes should return only the original hash.
+        let hash: u32 = 0x00013d8b; // arbitrary test hash
+        let result = neighbor_hashes(hash, HashType::PDBTrRosetta, 16, 4, 0.0, 0.0);
+        assert_eq!(result, vec![hash]);
+    }
+
+    #[test]
+    fn test_neighbor_hashes_produces_neighbors() {
+        use crate::geometry::core::HashType;
+        // With a large enough deviation (> bin_width/2 ≈ 0.6 Å for 16-bin distance
+        // over [2,20] Å), we are guaranteed to cross at least one bin boundary.
+        // Use 1.5 Å / 45° to ensure crossing regardless of where the hash center lands.
+        let hash: u32 = 0x00013d8b;
+        let result = neighbor_hashes(hash, HashType::PDBTrRosetta, 16, 4, 1.5, 45.0);
+        // Original hash must be included
+        assert!(result.contains(&hash), "original hash missing");
+        // At least some neighbors expected with this large deviation
+        assert!(result.len() > 1, "expected neighbors with large dev, got {:?}", result);
+        // All entries sorted and deduplicated
+        for i in 1..result.len() {
+            assert!(result[i] > result[i - 1], "not sorted/deduped");
+        }
     }
 }

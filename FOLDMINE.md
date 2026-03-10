@@ -40,6 +40,9 @@ folddisco mine -i <index_prefix> [options]
 | `--max-seeds <INT>` | `0` (unlimited) | Limit the number of seed edges explored (rarest first). Useful for very large or dense indices where full exploration is expensive. |
 | `--max-results <INT>` | `0` (unlimited) | Stop after discovering this many motifs. |
 | `--min-idf <FLOAT>` | `0.0` (no filter) | Minimum length-adjusted IDF score (`adj_idf`).  Filters out generic/trivial motifs such as alpha-helix contacts. Typical values: 0.5–2.0. |
+| `--require-complete` | off | Only output motifs where **every unordered node pair has at least one directed edge**.  Ensures all pairwise geometric relationships are captured.  Intermediate partial graphs are still explored internally for pruning efficiency, but not reported. |
+| `--fuzzy-dist <FLOAT>` | `0.0` (exact) | Distance deviation (Å) for fuzzy seed expansion.  Each seed hash is expanded by ±deviation on each distance feature; structure IDs from all neighbor hashes are unioned.  Improves recall for structures with minor conformational variation.  Paper default: **0.5 Å**. |
+| `--fuzzy-angle <FLOAT>` | `0.0` (exact) | Angle deviation (degrees) for fuzzy seed expansion.  Applied independently to each angle feature.  Paper default: **5.0°**.  Note: internally converted to radians for sin/cos hash types (PDBTrRosetta, TrRosetta, PDBMotifSinCos). |
 
 ### Output options
 
@@ -156,10 +159,20 @@ Build an index from local PDB files and run Foldmine:
 folddisco index -p data/serine_peptidases -i index/serine_peptidases_folddisco
 
 # Mine motifs present in >= 40% of the structures, up to 4 residues
+# --require-complete ensures all pairwise relationships are captured
 folddisco mine -i index/serine_peptidases_folddisco \
     --min-support 0.4 --max-freq 0.9 \
     --max-residues 4 \
+    --require-complete \
     -o motifs.tsv -v
+
+# Same search with fuzzy matching (paper defaults)
+folddisco mine -i index/serine_peptidases_folddisco \
+    --min-support 0.4 --max-freq 0.9 \
+    --max-residues 4 \
+    --require-complete \
+    --fuzzy-dist 0.5 --fuzzy-angle 5.0 \
+    -o motifs_fuzzy.tsv -v
 ```
 
 ### Pre-built Swiss-Prot index
@@ -222,6 +235,34 @@ If a single-edge motif with hash *h* appears in fewer than `min_support × N` st
 ### Canonical form
 
 Two abstract motif graphs that differ only by relabeling their residue positions (nodes) represent the same structural pattern. Foldmine normalizes every motif by trying all *n*! node-label permutations (at most 6! = 720 for `--max-residues 6`) and keeping the lexicographically smallest edge list. A concurrent DashMap tracks seen canonical forms so each unique motif is reported exactly once.
+
+### Fully-connected motifs (`--require-complete`)
+
+By default, Foldmine reports every sub-graph discovered during DFS growth, including sparse intermediate forms (e.g., a 3-node motif with only 2 edges).  When `--require-complete` is on, a motif is only reported if **every unordered node pair {i, j} has at least one directed edge** (either i→j or j→i).
+
+| Nodes | Minimum edges required | Example |
+|-------|----------------------|---------|
+| 2 | 1 | trivially satisfied by any seed |
+| 3 | 3 | a directed triangle |
+| 4 | 6 | all pairs covered |
+| k | k×(k−1)/2 | |
+
+The DFS growth and anti-monotone pruning continue as usual — partial motifs are still explored, just not reported.  This flag is most useful when you want all pairwise geometric constraints explicitly captured rather than relying on the absence of an edge to mean "unconstrained".
+
+### Fuzzy hash matching (`--fuzzy-dist`, `--fuzzy-angle`)
+
+Folddisco geometric hashes discretize distances and angles into bins.  A pair of residues whose geometry lies exactly on a bin boundary may be assigned to a different bin in a slightly different conformation, making the motif miss those structures under exact matching.
+
+The fuzzy expansion (described in the paper as "Extended search") addresses this:
+
+1. For each frequent seed hash *h*, decode it to continuous feature values.
+2. Apply ±`fuzzy_dist` (Å) independently to each distance feature and ±`fuzzy_angle` (°) independently to each angle feature — up to ~10 neighbor hashes.
+3. Look up the structure ID lists for all neighbor hashes in the index and **union** them with the exact-match list.
+4. Use this expanded list as the seed's support set for all subsequent intersection operations.
+
+This makes the effective support test "does the structure contain geometry approximately equal to this hash" rather than "exactly equal".
+
+> **Support inflation warning**: fuzzy expansion increases support counts (more structures match each seed), so effective support fractions are higher than under exact matching.  When using `--fuzzy-dist`/`--fuzzy-angle`, consider raising `--min-support` by 2–3× to compensate.
 
 ### Edge uniqueness
 

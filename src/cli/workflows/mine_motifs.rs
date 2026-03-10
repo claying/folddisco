@@ -27,6 +27,13 @@ mining options:
     --max-seeds <INT>            Limit number of seed edges considered (0=unlimited) [default: 0]
     --max-results <INT>          Stop after finding this many motifs (0=unlimited) [default: 0]
     --min-idf <FLOAT>            Minimum length-adjusted IDF score to include (0=no filter) [default: 0]
+    --require-complete           Only output motifs where every node pair has at least one
+                                 directed edge (fully-connected undirected graph) [default: off]
+    --fuzzy-dist <FLOAT>         Distance deviation (Å) for fuzzy seed expansion.
+                                 Unions structure IDs from ±deviation neighbor hashes.
+                                 0 = exact matching only. Paper default: 0.5 [default: 0]
+    --fuzzy-angle <FLOAT>        Angle deviation (degrees) for fuzzy seed expansion.
+                                 0 = exact matching only. Paper default: 5.0 [default: 0]
 
 output:
     -o, --output <PATH>          Output TSV path (default: stdout)
@@ -62,6 +69,9 @@ pub fn mine_motifs(env: AppArgs) {
             max_seeds,
             max_results,
             min_idf,
+            require_complete,
+            fuzzy_dist,
+            fuzzy_angle,
             output,
             threads,
             verbose,
@@ -137,6 +147,12 @@ pub fn mine_motifs(env: AppArgs) {
                 max_results,
                 threads,
                 min_idf,
+                require_complete,
+                fuzzy_dist,
+                fuzzy_angle,
+                hash_type: config.hash_type,
+                num_bin_dist: config.num_bin_dist,
+                num_bin_angle: config.num_bin_angle,
             };
 
             // Run the algorithm.
