@@ -17,7 +17,7 @@ subcommands:
   query     Query a motif from an index table
   benchmark Benchmark the performance of folddisco
   analyze   Analyze the distribution of encodings in the index
-  foldmine  Mine frequent structural motifs from an index (Foldmine)
+  mine      Mine frequent structural motifs from an index (Foldmine)
   version   Print version information
 
 options:

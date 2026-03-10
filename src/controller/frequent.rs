@@ -345,6 +345,10 @@ fn neighbor_hashes(
     dev_dist: f32,
     dev_angle_deg: f32,
 ) -> Vec<u32> {
+    // Normalise 0 → type-specific defaults so reverse_hash / perfect_hash_as_u32
+    // both operate with the same bin counts (0 means "use default" in the index
+    // config, but reverse_hash lacks the fallback that perfect_hash has).
+    let (nbin_dist, nbin_angle) = effective_nbins(hash_type, nbin_dist, nbin_angle);
     let gh = GeometricHash::from_u32(hash, hash_type);
     let mut decoded = vec![0.0f32; 16];
     gh.reverse_hash(nbin_dist, nbin_angle, &mut decoded);
@@ -408,6 +412,67 @@ fn neighbor_hashes(
     out.sort_unstable();
     out.dedup();
     out
+}
+
+// ---------------------------------------------------------------------------
+// Bin-count normalisation
+// ---------------------------------------------------------------------------
+
+/// Return the effective (nbin_dist, nbin_angle) for `hash_type`, replacing
+/// zero with the type-specific default that `perfect_hash_as_u32` uses
+/// internally.  This ensures `reverse_hash` — which lacks the same fallback
+/// logic — receives valid bin counts and produces physically sensible feature
+/// values.
+///
+/// Defaults match the guards inside each hash type's `perfect_hash` function:
+/// | Type              | dist | angle |
+/// |-------------------|------|-------|
+/// | PDBMotif          |  18  |   9   |
+/// | PDBMotifSinCos    |   8  |   3   |
+/// | TrRosetta         |   8  |   3   |
+/// | PDBTrRosetta      |  16  |   4   |
+/// | PointPairFeature  |   8  |   3   |
+/// | TertiaryInteraction|  8  |   3   |
+/// | Hybrid            |  16  |   4   |
+/// | FolddiscoAngle    |   8  |  32   |
+/// | FolddiscoDist     |  32  |   8   |
+#[inline]
+fn effective_nbins(hash_type: HashType, nbin_dist: usize, nbin_angle: usize) -> (usize, usize) {
+    let d = if nbin_dist == 0 {
+        match hash_type {
+            HashType::PDBMotif                => 18,
+            HashType::PDBMotifSinCos          =>  8,
+            HashType::TrRosetta               =>  8,
+            HashType::PDBTrRosetta            => 16,
+            HashType::PointPairFeature        =>  8,
+            HashType::TertiaryInteraction     =>  8,
+            HashType::Hybrid                  => 16,
+            HashType::FolddiscoAngle          =>  8,
+            HashType::FolddiscoDist           => 32,
+            #[allow(unreachable_patterns)]
+            _                                 => 16, // safe fallback
+        }
+    } else {
+        nbin_dist
+    };
+    let a = if nbin_angle == 0 {
+        match hash_type {
+            HashType::PDBMotif                =>  9,
+            HashType::PDBMotifSinCos          =>  3,
+            HashType::TrRosetta               =>  3,
+            HashType::PDBTrRosetta            =>  4,
+            HashType::PointPairFeature        =>  3,
+            HashType::TertiaryInteraction     =>  3,
+            HashType::Hybrid                  =>  4,
+            HashType::FolddiscoAngle          => 32,
+            HashType::FolddiscoDist           =>  8,
+            #[allow(unreachable_patterns)]
+            _                                 => 16, // safe fallback
+        }
+    } else {
+        nbin_angle
+    };
+    (d, a)
 }
 
 // ---------------------------------------------------------------------------
@@ -1053,6 +1118,11 @@ pub fn mine_frequent_motifs(
 // ---------------------------------------------------------------------------
 
 fn decode_hash(hash: u32, hash_type: HashType, nbin_dist: usize, nbin_angle: usize) -> String {
+    // Normalise 0 → type-specific defaults before calling reverse_hash.
+    // Indices built with "use default" bins store 0 in their .type config file,
+    // but reverse_hash lacks the automatic fallback that perfect_hash has,
+    // which would otherwise produce physically invalid (e.g. negative) values.
+    let (nbin_dist, nbin_angle) = effective_nbins(hash_type, nbin_dist, nbin_angle);
     let gh = GeometricHash::from_u32(hash, hash_type);
     let mut feat = vec![0.0f32; 16];
     gh.reverse_hash(nbin_dist, nbin_angle, &mut feat);
@@ -1276,6 +1346,90 @@ mod tests {
             ],
         };
         assert!(is_fully_connected(&m3_rev));
+    }
+
+    /// Regression test for the --require-complete bug report.
+    ///
+    /// The user observed a 4-node motif in the output with edges
+    ///   0→1, 0→2, 0→3, 1→0, 1→2, 1→3
+    /// and claimed --require-complete did not filter it.  The pair {2,3} has no
+    /// edge, so is_fully_connected MUST return false for this graph.
+    ///
+    /// If this test fails, the is_fully_connected implementation is buggy.
+    /// If this test passes but the user still sees the motif in output, the
+    /// likely cause is either an old binary or require_complete not reaching
+    /// dfs_grow (both of which are runtime / deployment issues, not logic bugs).
+    #[test]
+    fn test_is_fully_connected_4node_missing_pair() {
+        // Exact hashes from the user's report
+        let m = MotifGraph {
+            num_nodes: 4,
+            edges: vec![
+                MotifEdge { node_a: 0, node_b: 1, hash: 0x009dfd21 },
+                MotifEdge { node_a: 0, node_b: 2, hash: 0x009dfd21 },
+                MotifEdge { node_a: 0, node_b: 3, hash: 0x009dfd21 },
+                MotifEdge { node_a: 1, node_b: 0, hash: 0x120dfd12 },
+                MotifEdge { node_a: 1, node_b: 2, hash: 0x009dfd21 },
+                MotifEdge { node_a: 1, node_b: 3, hash: 0x120dfd12 },
+            ],
+        };
+        // Pair {2,3} has no covering edge — must be rejected.
+        assert!(
+            !is_fully_connected(&m),
+            "4-node motif with missing pair {{2,3}} must NOT pass is_fully_connected"
+        );
+
+        // Adding a 2→3 edge completes all pairs — must be accepted.
+        let mut edges_complete = m.edges.clone();
+        edges_complete.push(MotifEdge { node_a: 2, node_b: 3, hash: 0x11111111 });
+        let m_complete = MotifGraph { num_nodes: 4, edges: edges_complete };
+        assert!(
+            is_fully_connected(&m_complete),
+            "4-node motif with all pairs covered MUST pass is_fully_connected"
+        );
+    }
+
+    /// Test that effective_nbins fills in sensible defaults for the two most
+    /// common hash types used in practice.
+    #[test]
+    fn test_effective_nbins_defaults() {
+        use crate::geometry::core::HashType;
+        // PDBTrRosetta ("default") — distance bin = 16, sin/cos bin = 4.
+        let (d, a) = effective_nbins(HashType::PDBTrRosetta, 0, 0);
+        assert_eq!(d, 16, "PDBTrRosetta default dist bins");
+        assert_eq!(a,  4, "PDBTrRosetta default angle bins");
+
+        // PDBMotif — distance bin = 18, angle bin = 9.
+        let (d2, a2) = effective_nbins(HashType::PDBMotif, 0, 0);
+        assert_eq!(d2, 18, "PDBMotif default dist bins");
+        assert_eq!(a2,  9, "PDBMotif default angle bins");
+
+        // Non-zero values must be passed through unchanged.
+        let (d3, a3) = effective_nbins(HashType::PDBTrRosetta, 12, 3);
+        assert_eq!(d3, 12);
+        assert_eq!(a3,  3);
+    }
+
+    /// Smoke-test that decode_hash produces physically reasonable distances
+    /// (2–20 Å) when called with nbin_dist = 0 (the "use default" sentinel
+    /// stored in some index config files).  Before the effective_nbins fix this
+    /// produced large negative values (e.g. -232 Å) because reverse_hash
+    /// divided by (0 − 1) = −1 instead of the actual bin count.
+    #[test]
+    fn test_decode_hash_nbin_zero_no_negative_distances() {
+        use crate::geometry::core::HashType;
+        // Hash from user's report (PDBTrRosetta index built with default bins).
+        let hash: u32 = 0x009dfd21;
+        let s = decode_hash(hash, HashType::PDBTrRosetta, 0, 0);
+        // Parse ca_dist (3rd '/'-separated field after AA1/AA2).
+        let parts: Vec<&str> = s.split('/').collect();
+        assert!(parts.len() >= 4, "unexpected edge format: {}", s);
+        let ca: f32 = parts[2].parse().expect("ca_dist not a float");
+        let cb: f32 = parts[3].parse().expect("cb_dist not a float");
+        assert!(ca >= 0.0 && ca <= 25.0,
+            "ca_dist out of range [0,25]: {}  (full string: {})", ca, s);
+        assert!(cb >= 0.0 && cb <= 25.0,
+            "cb_dist out of range [0,25]: {}  (full string: {})", cb, s);
     }
 
     #[test]
