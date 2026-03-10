@@ -6,7 +6,7 @@
 //! Main entry point for Folddisco CLI
 
 // use crate::*;
-use folddisco::cli::{workflows::{build_index, benchmark, query_pdb, mine_motifs}, *};
+use folddisco::cli::{workflows::{build_index, benchmark, query_pdb, mine_motifs, search_motifs}, *};
 
 const VERSION_STRING: &str = env!("FOLDDISCO_BUILD_VERSION");
 const HELP: &str = "\
@@ -18,6 +18,7 @@ subcommands:
   benchmark Benchmark the performance of folddisco
   analyze   Analyze the distribution of encodings in the index
   mine      Mine frequent structural motifs from an index (Foldmine)
+  search    Check whether a query motif appears in a `mine` results file
   version   Print version information
 
 options:
@@ -147,6 +148,21 @@ fn parse_arg() -> Result<AppArgs, Box<dyn std::error::Error>> {
             verbose: args.contains(["-v", "--verbose"]),
             help: args.contains(["-h", "--help"]),
         }),
+        Some("search") => Ok(AppArgs::Search {
+            results_path: args.opt_value_from_str(["-f", "--results"])?,
+            pdb_path: args.opt_value_from_str(["-p", "--pdb"])?,
+            query_string: args.opt_value_from_str(["-q", "--query"])?,
+            index_path: args.opt_value_from_str(["-i", "--index"])?,
+            hash_type_str: args.value_from_str("--hash-type").unwrap_or_else(|_| "PDBTrRosetta".to_string()),
+            nbin_dist: args.value_from_str("--nbin-dist").unwrap_or(0usize),
+            nbin_angle: args.value_from_str("--nbin-angle").unwrap_or(0usize),
+            fuzzy_dist: args.value_from_str("--fuzzy-dist").unwrap_or(0.0f32),
+            fuzzy_angle: args.value_from_str("--fuzzy-angle").unwrap_or(0.0f32),
+            min_match: args.value_from_str("--min-match").unwrap_or(1.0f32),
+            output: args.opt_value_from_str(["-o", "--output"])?,
+            verbose: args.contains(["-v", "--verbose"]),
+            help: args.contains(["-h", "--help"]),
+        }),
         Some("version") => {
             println!("{}", VERSION_STRING);
             std::process::exit(0);
@@ -205,6 +221,14 @@ fn main() {
                 eprintln!("{}", workflows::mine_motifs::HELP_MINE);
             } else {
                 mine_motifs::mine_motifs(parsed_args);
+            }
+        }
+        AppArgs::Search { help, .. } => {
+            if help {
+                print_logo();
+                eprintln!("{}", workflows::search_motifs::HELP_SEARCH);
+            } else {
+                search_motifs::search_motifs(parsed_args);
             }
         }
     }

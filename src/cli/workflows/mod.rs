@@ -11,3 +11,4 @@ pub mod query_pdb;
 pub mod benchmark;
 pub mod analyze;
 pub mod mine_motifs;
+pub mod search_motifs;

@@ -144,6 +144,27 @@ pub enum AppArgs {
         verbose: bool,
         help: bool,
     },
+    Search {
+        /// Path to `folddisco mine` results TSV.
+        results_path: Option<String>,
+        /// Query PDB file.
+        pdb_path: Option<String>,
+        /// Residue specification (e.g. "F207,F212,F225,F229").
+        query_string: Option<String>,
+        /// Optional index prefix to read hash config from.
+        index_path: Option<String>,
+        /// Hash type string (used when index_path is None).
+        hash_type_str: String,
+        nbin_dist: usize,
+        nbin_angle: usize,
+        fuzzy_dist: f32,
+        fuzzy_angle: f32,
+        /// Minimum fraction of motif edges that must match [0.0, 1.0].
+        min_match: f32,
+        output: Option<String>,
+        verbose: bool,
+        help: bool,
+    },
 }
 
 pub fn print_logo() {

@@ -480,7 +480,7 @@ fn merge_isomorphic_motifs(results: &mut Vec<FrequentMotif>, total: usize, thres
 /// back in *radians*, so we convert before re-encoding.  For types that store
 /// raw degree values (PDBMotif, FolddiscoAngle, FolddiscoDist) no conversion
 /// is necessary.
-fn neighbor_hashes(
+pub fn neighbor_hashes(
     hash: u32,
     hash_type: HashType,
     nbin_dist: usize,
@@ -580,7 +580,7 @@ fn neighbor_hashes(
 /// | FolddiscoAngle    |   8  |  32   |
 /// | FolddiscoDist     |  32  |   8   |
 #[inline]
-fn effective_nbins(hash_type: HashType, nbin_dist: usize, nbin_angle: usize) -> (usize, usize) {
+pub fn effective_nbins(hash_type: HashType, nbin_dist: usize, nbin_angle: usize) -> (usize, usize) {
     let d = if nbin_dist == 0 {
         match hash_type {
             HashType::PDBMotif                => 18,
